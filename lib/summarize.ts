@@ -29,6 +29,25 @@ function stripJsonFence(text: string): string {
     .trim();
 }
 
+// Robust JSON parser: try direct parse first, then extract the outermost
+// {...} block. Sonnet with adaptive thinking sometimes prepends a sentence
+// before the JSON despite instructions; this recovers from that.
+function parseJsonLoose(text: string): unknown {
+  const cleaned = stripJsonFence(text);
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    // Find the first { and the matching last } and try again.
+    const start = cleaned.indexOf("{");
+    const end = cleaned.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+      const slice = cleaned.slice(start, end + 1);
+      return JSON.parse(slice);
+    }
+    throw new Error("no JSON object found");
+  }
+}
+
 function extractTextBlocks(msg: Anthropic.Message): string {
   return msg.content
     .filter((b): b is Anthropic.TextBlock => b.type === "text")
@@ -104,18 +123,27 @@ export async function generateSummary(args: {
     articleText: args.articleText,
   });
 
+  // Prefill the assistant response with "{" so the model *must* continue
+  // as a JSON object; adaptive thinking otherwise sometimes prepends prose.
+  // We prepend it back before parsing.
   const msg = await client.messages.create({
     model: SUMMARY_MODEL,
     max_tokens: 4096,
     system,
-    messages: [{ role: "user", content: user }],
+    messages: [
+      { role: "user", content: user },
+      { role: "assistant", content: "{" },
+    ],
   });
 
-  const raw = stripJsonFence(extractTextBlocks(msg));
+  const body = extractTextBlocks(msg);
+  const raw = body.startsWith("{") ? body : `{${body}`;
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
-  } catch {
+    parsed = parseJsonLoose(raw);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : "unknown";
+    console.error("Summary JSON parse failed:", detail, raw.slice(0, 300));
     throw new Error("Model did not return valid JSON.");
   }
   if (!parsed || typeof parsed !== "object") {
@@ -172,13 +200,15 @@ export async function translateWord(args: {
           sentence: args.sentence,
         }),
       },
+      { role: "assistant", content: "{" },
     ],
   });
 
-  const raw = stripJsonFence(extractTextBlocks(msg));
+  const body = extractTextBlocks(msg);
+  const raw = body.startsWith("{") ? body : `{${body}`;
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = parseJsonLoose(raw);
   } catch {
     throw new Error("Translator did not return valid JSON.");
   }
