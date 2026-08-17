@@ -41,11 +41,11 @@ export default async function SummaryPage({
         .map((t: Token) => lookupKey(t.l ?? t.t))
     )
   );
-  const initialStates: Record<string, { state: WordState; translation: string | null }> = {};
+  const initialStates: Record<string, { state: WordState; translation: string | null; pos: string | null }> = {};
   if (lemmas.length > 0) {
     const lookups = await supabase
       .from("word_lookups")
-      .select("lemma, state, translation")
+      .select("lemma, state, translation, part_of_speech")
       .eq("user_id", user.id)
       .eq("target_lang", summary.target_lang)
       .in("lemma", lemmas);
@@ -53,6 +53,7 @@ export default async function SummaryPage({
       initialStates[row.lemma] = {
         state: row.state as WordState,
         translation: row.translation ?? null,
+        pos: row.part_of_speech ?? null,
       };
     }
   }

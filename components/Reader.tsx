@@ -13,6 +13,7 @@ import { tapWord, finishReading } from "@/app/actions";
 type WordEntry = {
   state: WordState | undefined; // undefined = default (normal) — hasn't been touched this session
   translation: string | null;
+  pos: string | null;
   taps: number;
   isNewUnknown: boolean;
 };
@@ -21,7 +22,7 @@ type Props = {
   summary: Summary;
   articleTitle: string | null;
   articleUrl: string | null;
-  initialStates: Record<string, { state: WordState; translation: string | null }>;
+  initialStates: Record<string, { state: WordState; translation: string | null; pos: string | null }>;
 };
 
 export function Reader(props: Props) {
@@ -30,12 +31,19 @@ export function Reader(props: Props) {
     lemma: string;
     surface: string;
     translation: string | null;
+    pos: string | null;
     state: WordState | undefined;
   } | null>(null);
   const [entries, setEntries] = useState<Record<string, WordEntry>>(() => {
     const seed: Record<string, WordEntry> = {};
     for (const [k, v] of Object.entries(props.initialStates ?? {})) {
-      seed[k] = { state: v.state, translation: v.translation, taps: 0, isNewUnknown: false };
+      seed[k] = {
+        state: v.state,
+        translation: v.translation,
+        pos: v.pos,
+        taps: 0,
+        isNewUnknown: false,
+      };
     }
     return seed;
   });
@@ -91,6 +99,7 @@ export function Reader(props: Props) {
         [key]: {
           state: nxt,
           translation: prevEntry?.translation ?? null,
+          pos: prevEntry?.pos ?? null,
           taps: (prevEntry?.taps ?? 0) + 1,
           isNewUnknown:
             prevEntry?.isNewUnknown ||
@@ -101,6 +110,7 @@ export function Reader(props: Props) {
         lemma: key,
         surface: tok.t,
         translation: prevEntry?.translation ?? null,
+        pos: prevEntry?.pos ?? null,
         state: nxt,
       });
 
@@ -115,7 +125,7 @@ export function Reader(props: Props) {
           setEntries((cur) => ({
             ...cur,
             [key]: {
-              ...(cur[key] ?? { taps: 1, isNewUnknown: false }),
+              ...(cur[key] ?? { taps: 1, isNewUnknown: false, pos: null }),
               state: res.state,
               translation: cur[key]?.translation ?? res.translation ?? null,
             },
@@ -132,14 +142,31 @@ export function Reader(props: Props) {
               }),
             });
             if (r.ok) {
-              const j = (await r.json()) as { translation?: string };
+              const j = (await r.json()) as {
+                translation?: string;
+                pos?: string;
+                lemma?: string;
+              };
               const translation = j.translation ?? null;
+              const pos = j.pos ?? null;
+              const serverLemma = j.lemma ?? key;
               setEntries((cur) => ({
                 ...cur,
-                [key]: { ...(cur[key] ?? { state: "unknown", taps: 1, isNewUnknown: true }), translation },
+                [key]: {
+                  ...(cur[key] ?? {
+                    state: "unknown",
+                    taps: 1,
+                    isNewUnknown: true,
+                    pos: null,
+                  }),
+                  translation,
+                  pos,
+                },
               }));
               setSelected((cur) =>
-                cur && cur.lemma === key ? { ...cur, translation } : cur
+                cur && cur.lemma === key
+                  ? { ...cur, translation, pos, lemma: serverLemma }
+                  : cur
               );
             }
           }
@@ -231,31 +258,39 @@ export function Reader(props: Props) {
         )}
       </article>
 
-      {selected && (
-        <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm">
-          <div className="flex items-baseline justify-between">
-            <div>
+      {selected && (() => {
+        const isVerb = selected.pos === "verb";
+        const lemmaDiffers = selected.lemma && selected.lemma !== selected.surface.toLowerCase();
+        // Always surface the lemma for verbs (it's the infinitive) so the
+        // reader learns the dictionary form, not just this conjugation.
+        const showLemma = isVerb || lemmaDiffers;
+        return (
+          <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm">
+            <div className="flex items-baseline justify-between">
               <span className="text-base font-semibold text-slate-900">
                 {selected.surface}
               </span>
-              {selected.lemma !== selected.surface.toLowerCase() && (
-                <span className="ml-2 text-xs text-slate-500">
-                  ({selected.lemma})
-                </span>
-              )}
+              <span className="text-xs uppercase tracking-wide text-slate-500">
+                {selected.state ?? "mastered"}
+              </span>
             </div>
-            <span className="text-xs uppercase tracking-wide text-slate-500">
-              {selected.state ?? "mastered"}
-            </span>
+            {showLemma && (
+              <div className="mt-1 text-sm text-slate-600">
+                <span className="text-xs uppercase tracking-wide text-slate-400">
+                  {isVerb ? "infinitive" : "base form"}
+                </span>{" "}
+                <span className="italic text-slate-800">{selected.lemma}</span>
+              </div>
+            )}
+            <div className="mt-2 text-slate-800">
+              {selected.translation ?? (pending ? "translating…" : "—")}
+            </div>
+            <div className="mt-2 text-xs text-slate-500">
+              Tap again to cycle: unknown → seen → mastered.
+            </div>
           </div>
-          <div className="mt-1 text-slate-700">
-            {selected.translation ?? (pending ? "translating…" : "—")}
-          </div>
-          <div className="mt-2 text-xs text-slate-500">
-            Tap again to cycle: unknown → seen → mastered.
-          </div>
-        </div>
-      )}
+        );
+      })()}
 
       <div className="fixed inset-x-0 bottom-0 border-t border-slate-200 bg-white/95 backdrop-blur">
         <div className="mx-auto flex max-w-2xl items-center justify-between gap-3 px-4 py-3 text-sm">
