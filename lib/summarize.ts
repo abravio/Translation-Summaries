@@ -21,38 +21,92 @@ export type SummaryResult = {
   model: string;
 };
 
-function stripJsonFence(text: string): string {
-  return text
-    .trim()
-    .replace(/^```(?:json)?\s*/i, "")
-    .replace(/\s*```$/i, "")
-    .trim();
-}
+// Force structured output via tool_use. `tool_choice` names the tool the
+// model must call, so its `input` is guaranteed to match this schema —
+// no freeform-JSON parsing gymnastics.
+const SUMMARY_TOOL: Anthropic.Tool = {
+  name: "emit_summary",
+  description:
+    "Emit the learner-facing summary as structured data. Call this exactly once.",
+  input_schema: {
+    type: "object",
+    properties: {
+      summary_target: {
+        type: "string",
+        description:
+          "The summary in the target language (Spanish), 1-2 short paragraphs.",
+      },
+      summary_native: {
+        type: "string",
+        description:
+          "Verbatim translation of summary_target into the native language (English).",
+      },
+      tokens: {
+        type: "array",
+        description:
+          "Ordered token list covering summary_target end-to-end (words + punctuation + spaces).",
+        items: {
+          type: "object",
+          properties: {
+            surface: {
+              type: "string",
+              description: "Exact substring as it appears in summary_target.",
+            },
+            lemma: {
+              type: "string",
+              description: "Base form (lowercase). Empty string for non-words.",
+            },
+            pos: {
+              type: "string",
+              description:
+                "Part of speech: noun, verb, adj, adv, pron, det, prep, conj, num, other. Empty for non-words.",
+            },
+            is_word: {
+              type: "boolean",
+              description: "True for translatable words; false for punctuation/spaces/digits.",
+            },
+          },
+          required: ["surface", "is_word"],
+        },
+      },
+      featured_lemmas: {
+        type: "array",
+        description: "Priority learning words the summary intentionally used.",
+        items: { type: "string" },
+      },
+    },
+    required: ["summary_target", "summary_native", "tokens", "featured_lemmas"],
+  },
+};
 
-// Robust JSON parser: try direct parse first, then extract the outermost
-// {...} block. Sonnet with adaptive thinking sometimes prepends a sentence
-// before the JSON despite instructions; this recovers from that.
-function parseJsonLoose(text: string): unknown {
-  const cleaned = stripJsonFence(text);
-  try {
-    return JSON.parse(cleaned);
-  } catch {
-    // Find the first { and the matching last } and try again.
-    const start = cleaned.indexOf("{");
-    const end = cleaned.lastIndexOf("}");
-    if (start >= 0 && end > start) {
-      const slice = cleaned.slice(start, end + 1);
-      return JSON.parse(slice);
+const TRANSLATE_TOOL: Anthropic.Tool = {
+  name: "emit_translation",
+  description:
+    "Emit a single-word translation. Call this exactly once.",
+  input_schema: {
+    type: "object",
+    properties: {
+      lemma: { type: "string", description: "Dictionary base form, lowercase." },
+      pos: {
+        type: "string",
+        description: "noun, verb, adj, adv, pron, det, prep, conj, num, other.",
+      },
+      translation: {
+        type: "string",
+        description: "Concise gloss in the native language for the sense used in the sentence.",
+      },
+    },
+    required: ["lemma", "pos", "translation"],
+  },
+};
+
+function firstToolInput(msg: Anthropic.Message, name: string): Record<string, unknown> | null {
+  for (const block of msg.content) {
+    if (block.type === "tool_use" && block.name === name) {
+      return block.input as Record<string, unknown>;
     }
-    throw new Error("no JSON object found");
   }
-}
-
-function extractTextBlocks(msg: Anthropic.Message): string {
-  return msg.content
-    .filter((b): b is Anthropic.TextBlock => b.type === "text")
-    .map((b) => b.text)
-    .join("");
+  return null;
 }
 
 // Fall back to a surface-only token list if the model's tokens don't line up
@@ -95,7 +149,6 @@ function reconcileTokens(summary: string, modelTokens: unknown): Token[] {
       return rebuilt;
     }
   }
-  // Model output didn't round-trip → derive tokens from the summary directly.
   return surfaceTokenize(summary);
 }
 
@@ -125,33 +178,27 @@ export async function generateSummary(args: {
 
   const msg = await client.messages.create({
     model: SUMMARY_MODEL,
-    max_tokens: 4096,
+    max_tokens: 8192,
     system,
+    tools: [SUMMARY_TOOL],
+    tool_choice: { type: "tool", name: SUMMARY_TOOL.name },
     messages: [{ role: "user", content: user }],
   });
 
-  const raw = extractTextBlocks(msg);
-  let parsed: unknown;
-  try {
-    parsed = parseJsonLoose(raw);
-  } catch (err) {
-    const detail = err instanceof Error ? err.message : "unknown";
-    console.error("Summary JSON parse failed:", detail, raw.slice(0, 300));
-    throw new Error("Model did not return valid JSON.");
+  const input = firstToolInput(msg, SUMMARY_TOOL.name);
+  if (!input) {
+    console.error("Summary tool_use missing. Stop reason:", msg.stop_reason);
+    throw new Error("Model did not return a structured summary.");
   }
-  if (!parsed || typeof parsed !== "object") {
-    throw new Error("Model returned an unexpected shape.");
-  }
-  const p = parsed as Record<string, unknown>;
-  const summary_target = typeof p.summary_target === "string" ? p.summary_target : "";
-  const summary_native = typeof p.summary_native === "string" ? p.summary_native : "";
+  const summary_target = typeof input.summary_target === "string" ? input.summary_target : "";
+  const summary_native = typeof input.summary_native === "string" ? input.summary_native : "";
   if (!summary_target || !summary_native) {
     throw new Error("Model omitted summary_target or summary_native.");
   }
-  const featured_lemmas = Array.isArray(p.featured_lemmas)
-    ? p.featured_lemmas.filter((x): x is string => typeof x === "string")
+  const featured_lemmas = Array.isArray(input.featured_lemmas)
+    ? input.featured_lemmas.filter((x): x is string => typeof x === "string")
     : [];
-  const tokens = reconcileTokens(summary_target, p.tokens);
+  const tokens = reconcileTokens(summary_target, input.tokens);
 
   return {
     summary_target,
@@ -180,11 +227,13 @@ export async function translateWord(args: {
   const client = new Anthropic();
   const msg = await client.messages.create({
     model: TRANSLATE_MODEL,
-    max_tokens: 256,
+    max_tokens: 512,
     system: translateWordSystemPrompt({
       targetLang: args.targetLang,
       nativeLang: args.nativeLang,
     }),
+    tools: [TRANSLATE_TOOL],
+    tool_choice: { type: "tool", name: TRANSLATE_TOOL.name },
     messages: [
       {
         role: "user",
@@ -196,17 +245,14 @@ export async function translateWord(args: {
     ],
   });
 
-  const raw = extractTextBlocks(msg);
-  let parsed: unknown;
-  try {
-    parsed = parseJsonLoose(raw);
-  } catch {
-    throw new Error("Translator did not return valid JSON.");
-  }
-  const p = (parsed ?? {}) as Record<string, unknown>;
-  const lemma = typeof p.lemma === "string" && p.lemma ? p.lemma.toLowerCase() : args.word.toLowerCase();
-  const pos = typeof p.pos === "string" ? p.pos : "other";
-  const translation = typeof p.translation === "string" ? p.translation : "";
+  const input = firstToolInput(msg, TRANSLATE_TOOL.name);
+  if (!input) throw new Error("Translator did not return a structured result.");
+  const lemma =
+    typeof input.lemma === "string" && input.lemma
+      ? input.lemma.toLowerCase()
+      : args.word.toLowerCase();
+  const pos = typeof input.pos === "string" ? input.pos : "other";
+  const translation = typeof input.translation === "string" ? input.translation : "";
   if (!translation) throw new Error("Translator returned no translation.");
   return { lemma, pos, translation, model: TRANSLATE_MODEL };
 }
