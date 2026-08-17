@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { createHash } from "node:crypto";
 import { createClient } from "@/lib/supabase/server";
 import { fetchAndExtract } from "@/lib/readability";
 import { generateSummary } from "@/lib/summarize";
@@ -8,10 +9,15 @@ import { clampLevel } from "@/lib/level";
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
+// Either give a URL (we fetch + parse) or paste text directly (paywall escape).
 type Payload = {
   url?: string;
+  text?: string;
+  title?: string;
   level?: number;
 };
+
+const MAX_PASTE_CHARS = 20_000;
 
 function normalizeUrl(input: string): string {
   const u = new URL(input);
@@ -20,6 +26,13 @@ function normalizeUrl(input: string): string {
   for (const k of drop) u.searchParams.delete(k);
   u.hash = "";
   return u.toString();
+}
+
+// Pasted content gets a synthetic URL keyed by content hash so re-pasting the
+// same article still hits the (user, url) dedup index and reuses the summary.
+function pasteKey(text: string): string {
+  const hash = createHash("sha256").update(text).digest("hex").slice(0, 16);
+  return `paste:sha256:${hash}`;
 }
 
 export async function POST(request: Request) {
@@ -42,13 +55,26 @@ export async function POST(request: Request) {
   } catch {
     return NextResponse.json({ error: "Malformed request." }, { status: 400 });
   }
-  if (!body.url) return NextResponse.json({ error: "Missing url." }, { status: 400 });
+  const pastedText = (body.text ?? "").trim();
+  if (!body.url && !pastedText) {
+    return NextResponse.json({ error: "Give a URL or paste article text." }, { status: 400 });
+  }
+  if (pastedText && pastedText.length < 200) {
+    return NextResponse.json(
+      { error: "Pasted text is too short — need at least a few paragraphs." },
+      { status: 400 }
+    );
+  }
 
   let url: string;
-  try {
-    url = normalizeUrl(body.url);
-  } catch {
-    return NextResponse.json({ error: "That doesn't look like a URL." }, { status: 400 });
+  if (pastedText) {
+    url = pasteKey(pastedText);
+  } else {
+    try {
+      url = normalizeUrl(body.url!);
+    } catch {
+      return NextResponse.json({ error: "That doesn't look like a URL." }, { status: 400 });
+    }
   }
 
   const settings = await getOrCreateSettings(supabase, user.id);
@@ -69,13 +95,37 @@ export async function POST(request: Request) {
     articleId = existingArticle.data.id;
     articleTitle = existingArticle.data.title ?? null;
     articleText = existingArticle.data.original_text;
+  } else if (pastedText) {
+    const capped =
+      pastedText.length > MAX_PASTE_CHARS ? pastedText.slice(0, MAX_PASTE_CHARS) : pastedText;
+    const title = (body.title ?? "").trim() || "Pasted article";
+    const ins = await supabase
+      .from("articles")
+      .insert({
+        user_id: user.id,
+        url,
+        title,
+        source_lang: settings.native_lang,
+        original_text: capped,
+        char_count: pastedText.length,
+      })
+      .select("id")
+      .single();
+    if (ins.error) return NextResponse.json({ error: ins.error.message }, { status: 500 });
+    articleId = ins.data.id;
+    articleTitle = title;
+    articleText = capped;
   } else {
     let extracted;
     try {
       extracted = await fetchAndExtract(url);
     } catch (e) {
       return NextResponse.json(
-        { error: e instanceof Error ? e.message : "Failed to fetch article." },
+        {
+          error:
+            (e instanceof Error ? e.message : "Failed to fetch article.") +
+            " Tip: switch to \"Paste text\" and copy the article body directly.",
+        },
         { status: 400 }
       );
     }
