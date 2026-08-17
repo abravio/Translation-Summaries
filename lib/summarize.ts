@@ -5,7 +5,7 @@ import {
   translateWordSystemPrompt,
   translateWordUserPrompt,
 } from "@/lib/prompts";
-import { surfaceTokenize, detokenize } from "@/lib/tokenize";
+import { surfaceTokenize } from "@/lib/tokenize";
 import type { Token } from "@/lib/types";
 
 const SUMMARY_MODEL = "claude-sonnet-5";
@@ -24,6 +24,11 @@ export type SummaryResult = {
 // Force structured output via tool_use. `tool_choice` names the tool the
 // model must call, so its `input` is guaranteed to match this schema —
 // no freeform-JSON parsing gymnastics.
+//
+// Tokens/lemmas are NOT model-generated — a model-generated token list is
+// most of the output volume and dominates latency. We surface-tokenize on
+// the server after the call returns; lemmas are filled in on demand when
+// the reader taps a word (that call was already happening anyway).
 const SUMMARY_TOOL: Anthropic.Tool = {
   name: "emit_summary",
   description:
@@ -41,41 +46,13 @@ const SUMMARY_TOOL: Anthropic.Tool = {
         description:
           "Verbatim translation of summary_target into the native language (English).",
       },
-      tokens: {
-        type: "array",
-        description:
-          "Ordered token list covering summary_target end-to-end (words + punctuation + spaces).",
-        items: {
-          type: "object",
-          properties: {
-            surface: {
-              type: "string",
-              description: "Exact substring as it appears in summary_target.",
-            },
-            lemma: {
-              type: "string",
-              description: "Base form (lowercase). Empty string for non-words.",
-            },
-            pos: {
-              type: "string",
-              description:
-                "Part of speech: noun, verb, adj, adv, pron, det, prep, conj, num, other. Empty for non-words.",
-            },
-            is_word: {
-              type: "boolean",
-              description: "True for translatable words; false for punctuation/spaces/digits.",
-            },
-          },
-          required: ["surface", "is_word"],
-        },
-      },
       featured_lemmas: {
         type: "array",
         description: "Priority learning words the summary intentionally used.",
         items: { type: "string" },
       },
     },
-    required: ["summary_target", "summary_native", "tokens", "featured_lemmas"],
+    required: ["summary_target", "summary_native", "featured_lemmas"],
   },
 };
 
@@ -107,49 +84,6 @@ function firstToolInput(msg: Anthropic.Message, name: string): Record<string, un
     }
   }
   return null;
-}
-
-// Fall back to a surface-only token list if the model's tokens don't line up
-// with summary_target byte-for-byte. Tap-to-translate still works — it'll just
-// use the surface form as the lookup key until the on-demand /api/translate
-// call fills in the lemma.
-function reconcileTokens(summary: string, modelTokens: unknown): Token[] {
-  if (Array.isArray(modelTokens)) {
-    const rebuilt: Token[] = [];
-    let leadingWs = false;
-    for (const raw of modelTokens) {
-      if (!raw || typeof raw !== "object") continue;
-      const r = raw as Record<string, unknown>;
-      const surface = typeof r.surface === "string" ? r.surface : "";
-      if (!surface) continue;
-      // Pure whitespace token → carry the flag onto the next token.
-      if (/^\s+$/.test(surface)) {
-        leadingWs = true;
-        continue;
-      }
-      // Whitespace baked into the surface — split it off.
-      const wsMatch = surface.match(/^\s+/);
-      if (wsMatch) leadingWs = true;
-      const core = wsMatch ? surface.slice(wsMatch[0].length) : surface;
-      if (!core) continue;
-
-      const isWord = r.is_word === true;
-      const lemma = typeof r.lemma === "string" && r.lemma ? r.lemma.toLowerCase() : undefined;
-      const pos = typeof r.pos === "string" && r.pos ? r.pos : undefined;
-      rebuilt.push({
-        t: core,
-        w: isWord,
-        ws: leadingWs,
-        ...(isWord && lemma ? { l: lemma } : {}),
-        ...(isWord && pos ? { pos } : {}),
-      });
-      leadingWs = false;
-    }
-    if (detokenize(rebuilt).trim() === summary.trim()) {
-      return rebuilt;
-    }
-  }
-  return surfaceTokenize(summary);
 }
 
 export async function generateSummary(args: {
@@ -198,7 +132,8 @@ export async function generateSummary(args: {
   const featured_lemmas = Array.isArray(input.featured_lemmas)
     ? input.featured_lemmas.filter((x): x is string => typeof x === "string")
     : [];
-  const tokens = reconcileTokens(summary_target, input.tokens);
+  // Server-side tokenize. Lemmas fill in on demand as the reader taps words.
+  const tokens = surfaceTokenize(summary_target);
 
   return {
     summary_target,

@@ -39,20 +39,14 @@ export function summarySystemPrompt(args: {
 
   return `You produce reading-practice summaries for a language learner.
 
-Language pair: source article is arbitrary (usually ${native}), you summarize into ${target} at a specific difficulty level, and you also provide a verbatim ${native} translation of your ${target} summary for the learner to reveal on demand.
+The source article is in ${native}. Summarize it into ${target} at the specified difficulty level, and also produce a verbatim ${native} translation of your ${target} summary for the learner to reveal on demand.
 
 Difficulty level: ${args.level}/10. ${LEVEL_GUIDANCE[args.level] ?? ""}
 ${focusLine}
 ${priorityBlock}
-Length: 1-2 short paragraphs (roughly 90-180 words of ${target}).
+Length: 1-2 short paragraphs, roughly 90-180 words of ${target}.
 
-Output rules:
-- Respond with ONE JSON object and nothing else. No prose, no code fences.
-- Shape: {"summary_target": string, "summary_native": string, "tokens": [{"surface": string, "lemma": string, "pos": string, "is_word": boolean}, ...], "featured_lemmas": [string, ...]}
-- \`tokens\` must cover EVERY visible character of \`summary_target\` in order — words AND punctuation AND spaces between them. Concatenating every \`surface\` in order (no separators) must reproduce \`summary_target\` byte-for-byte.
-- For word tokens set \`is_word\`: true and give the base form as \`lemma\` (lowercase, e.g. "corrió" → "correr", "casas" → "casa"). \`pos\` is one of: noun, verb, adj, adv, pron, det, prep, conj, num, other.
-- For non-word tokens (spaces, punctuation, digits, symbols) set \`is_word\`: false and repeat the character(s) as \`surface\`; \`lemma\` and \`pos\` may be empty strings.
-- \`featured_lemmas\` lists the priority learning words you actually used in the summary.
+Call the \`emit_summary\` tool exactly once with your result. \`featured_lemmas\` should list the priority learning words you actually used (base forms, lowercase).
 `;
 }
 
