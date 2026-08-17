@@ -108,7 +108,6 @@ export function UrlForm({ currentLevel }: { currentLevel: number }) {
             <input
               id="title"
               type="text"
-              placeholder="e.g. Iran's plan to escalate"
               value={title}
               onChange={(e) => setTitle(e.target.value)}
               className="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-base focus:border-slate-500 focus:outline-none"

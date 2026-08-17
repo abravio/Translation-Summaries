@@ -123,21 +123,14 @@ export async function generateSummary(args: {
     articleText: args.articleText,
   });
 
-  // Prefill the assistant response with "{" so the model *must* continue
-  // as a JSON object; adaptive thinking otherwise sometimes prepends prose.
-  // We prepend it back before parsing.
   const msg = await client.messages.create({
     model: SUMMARY_MODEL,
     max_tokens: 4096,
     system,
-    messages: [
-      { role: "user", content: user },
-      { role: "assistant", content: "{" },
-    ],
+    messages: [{ role: "user", content: user }],
   });
 
-  const body = extractTextBlocks(msg);
-  const raw = body.startsWith("{") ? body : `{${body}`;
+  const raw = extractTextBlocks(msg);
   let parsed: unknown;
   try {
     parsed = parseJsonLoose(raw);
@@ -200,12 +193,10 @@ export async function translateWord(args: {
           sentence: args.sentence,
         }),
       },
-      { role: "assistant", content: "{" },
     ],
   });
 
-  const body = extractTextBlocks(msg);
-  const raw = body.startsWith("{") ? body : `{${body}`;
+  const raw = extractTextBlocks(msg);
   let parsed: unknown;
   try {
     parsed = parseJsonLoose(raw);
